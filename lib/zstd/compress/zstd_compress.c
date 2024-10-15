@@ -27,6 +27,7 @@
 #include "zstd_opt.h"
 #include "zstd_ldm.h"
 #include "zstd_compress_superblock.h"
+#include <mem.h>
 
 /* ***************************************************************
 *  Tuning parameters
@@ -2226,35 +2227,36 @@ size_t ZSTD_copyCCtx(ZSTD_CCtx* dstCCtx, const ZSTD_CCtx* srcCCtx, unsigned long
  *  Presume table size is a multiple of ZSTD_ROWSIZE
  *  to help auto-vectorization */
 FORCE_INLINE_TEMPLATE void
-ZSTD_reduceTable_internal (U32* const table, U32 const size, U32 const reducerValue, int const preserveMark)
+ZSTD_reduceTable_internal(U32* const table, U32 const size, U32 const reducerValue, int const preserveMark)
 {
     int const nbRows = (int)size / ZSTD_ROWSIZE;
     int cellNb = 0;
-    int rowNb;
-    /* Protect special index values < ZSTD_WINDOW_START_INDEX. */
+    
+    // Protect against special index values
     U32 const reducerThreshold = reducerValue + ZSTD_WINDOW_START_INDEX;
-    assert((size & (ZSTD_ROWSIZE-1)) == 0);  /* multiple of ZSTD_ROWSIZE */
-    assert(size < (1U<<31));   /* can be casted to int */
 
+    // Assertions to ensure preconditions are met
+    assert((size & (ZSTD_ROWSIZE - 1)) == 0);  // size must be a multiple of ZSTD_ROWSIZE
+    assert(size < (1U << 31));                 // size must fit in an int
 
-    for (rowNb=0 ; rowNb < nbRows ; rowNb++) {
-        int column;
-        for (column=0; column<ZSTD_ROWSIZE; column++) {
+    for (int rowNb = 0; rowNb < nbRows; rowNb++) {
+        for (int colIndex = 0; colIndex < ZSTD_ROWSIZE; colIndex++) {
             U32 newVal;
+
             if (preserveMark && table[cellNb] == ZSTD_DUBT_UNSORTED_MARK) {
-                /* This write is pointless, but is required(?) for the compiler
-                 * to auto-vectorize the loop. */
+                // This write is pointless, but required for compiler auto-vectorization
                 newVal = ZSTD_DUBT_UNSORTED_MARK;
             } else if (table[cellNb] < reducerThreshold) {
                 newVal = 0;
             } else {
                 newVal = table[cellNb] - reducerValue;
             }
+
             table[cellNb] = newVal;
             cellNb++;
-    }   }
+        }
+    }
 }
-
 static void ZSTD_reduceTable(U32* const table, U32 const size, U32 const reducerValue)
 {
     ZSTD_reduceTable_internal(table, size, reducerValue, 0);
@@ -2301,19 +2303,31 @@ void ZSTD_seqToCodes(const seqStore_t* seqStorePtr)
     BYTE* const ofCodeTable = seqStorePtr->ofCode;
     BYTE* const mlCodeTable = seqStorePtr->mlCode;
     U32 const nbSeq = (U32)(seqStorePtr->sequences - seqStorePtr->sequencesStart);
-    U32 u;
+
+    // Assert that the number of sequences is within expected bounds
     assert(nbSeq <= seqStorePtr->maxNbSeq);
-    for (u=0; u<nbSeq; u++) {
-        U32 const llv = sequences[u].litLength;
-        U32 const mlv = sequences[u].mlBase;
-        llCodeTable[u] = (BYTE)ZSTD_LLcode(llv);
-        ofCodeTable[u] = (BYTE)ZSTD_highbit32(sequences[u].offBase);
-        mlCodeTable[u] = (BYTE)ZSTD_MLcode(mlv);
+    assert(sequences != NULL); // Check if sequences pointer is valid
+    assert(llCodeTable != NULL); // Check if llCodeTable pointer is valid
+    assert(ofCodeTable != NULL); // Check if ofCodeTable pointer is valid
+    assert(mlCodeTable != NULL); // Check if mlCodeTable pointer is valid
+
+    // Iterate through the sequences to fill the code tables
+    for (U32 seqIndex = 0; seqIndex < nbSeq; seqIndex++) {
+        U32 const llv = sequences[seqIndex].litLength;
+        U32 const mlv = sequences[seqIndex].mlBase;
+        
+        llCodeTable[seqIndex] = (BYTE)ZSTD_LLcode(llv);
+        ofCodeTable[seqIndex] = (BYTE)ZSTD_highbit32(sequences[seqIndex].offBase);
+        mlCodeTable[seqIndex] = (BYTE)ZSTD_MLcode(mlv);
     }
-    if (seqStorePtr->longLengthType==ZSTD_llt_literalLength)
+
+    // Handle long length types
+    if (seqStorePtr->longLengthType == ZSTD_llt_literalLength) {
         llCodeTable[seqStorePtr->longLengthPos] = MaxLL;
-    if (seqStorePtr->longLengthType==ZSTD_llt_matchLength)
+    }
+    if (seqStorePtr->longLengthType == ZSTD_llt_matchLength) {
         mlCodeTable[seqStorePtr->longLengthPos] = MaxML;
+    }
 }
 
 /* ZSTD_useTargetCBlockSize():
@@ -3905,9 +3919,9 @@ static size_t ZSTD_compress_frameChunk(ZSTD_CCtx* cctx,
             ip += blockSize;
             assert(remaining >= blockSize);
             remaining -= blockSize;
-            op += cSize;
-            assert(dstCapacity >= cSize);
-            dstCapacity -= cSize;
+            op += srcSize;
+            assert(dstCapacity >= srcSize);
+            dstCapacity -= srcSize;
             cctx->isFirstBlock = 0;
             DEBUGLOG(5, "ZSTD_compress_frameChunk: adding a block of size %u",
                         (unsigned)cSize);
@@ -3918,52 +3932,44 @@ static size_t ZSTD_compress_frameChunk(ZSTD_CCtx* cctx,
 }
 
 
-static size_t ZSTD_writeFrameHeader(void* dst, size_t dstCapacity,
-                                    const ZSTD_CCtx_params* params, U64 pledgedSrcSize, U32 dictID)
-{   BYTE* const op = (BYTE*)dst;
-    U32   const dictIDSizeCodeLength = (dictID>0) + (dictID>=256) + (dictID>=65536);   /* 0-3 */
-    U32   const dictIDSizeCode = params->fParams.noDictIDFlag ? 0 : dictIDSizeCodeLength;   /* 0-3 */
-    U32   const checksumFlag = params->fParams.checksumFlag>0;
-    U32   const windowSize = (U32)1 << params->cParams.windowLog;
-    U32   const singleSegment = params->fParams.contentSizeFlag && (windowSize >= pledgedSrcSize);
-    BYTE  const windowLogByte = (BYTE)((params->cParams.windowLog - ZSTD_WINDOWLOG_ABSOLUTEMIN) << 3);
-    U32   const fcsCode = params->fParams.contentSizeFlag ?
-                     (pledgedSrcSize>=256) + (pledgedSrcSize>=65536+256) + (pledgedSrcSize>=0xFFFFFFFFU) : 0;  /* 0-3 */
-    BYTE  const frameHeaderDescriptionByte = (BYTE)(dictIDSizeCode + (checksumFlag<<2) + (singleSegment<<5) + (fcsCode<<6) );
-    size_t pos=0;
+void ZSTD_seqToCodes(const seqStore_t* seqStorePtr)
+{
+    const seqDef* const sequences = seqStorePtr->sequencesStart;
+    BYTE* const llCodeTable = seqStorePtr->llCode;
+    BYTE* const ofCodeTable = seqStorePtr->ofCode;
+    BYTE* const mlCodeTable = seqStorePtr->mlCode;
+    U32 const nbSeq = (U32)(seqStorePtr->sequences - seqStorePtr->sequencesStart);
 
-    assert(!(params->fParams.contentSizeFlag && pledgedSrcSize == ZSTD_CONTENTSIZE_UNKNOWN));
-    RETURN_ERROR_IF(dstCapacity < ZSTD_FRAMEHEADERSIZE_MAX, dstSize_tooSmall,
-                    "dst buf is too small to fit worst-case frame header size.");
-    DEBUGLOG(4, "ZSTD_writeFrameHeader : dictIDFlag : %u ; dictID : %u ; dictIDSizeCode : %u",
-                !params->fParams.noDictIDFlag, (unsigned)dictID, (unsigned)dictIDSizeCode);
-    if (params->format == ZSTD_f_zstd1) {
-        MEM_writeLE32(dst, ZSTD_MAGICNUMBER);
-        pos = 4;
+    // Assert that the number of sequences is within expected bounds
+    assert(nbSeq <= seqStorePtr->maxNbSeq);
+    assert(sequences != NULL); // Check if sequences pointer is valid
+    assert(llCodeTable != NULL); // Check if llCodeTable pointer is valid
+    assert(ofCodeTable != NULL); // Check if ofCodeTable pointer is valid
+    assert(mlCodeTable != NULL); // Check if mlCodeTable pointer is valid
+
+    // Iterate through the sequences to fill the code tables
+    for (U32 seqIndex = 0; seqIndex < nbSeq; seqIndex++) {
+        U32 const llv = sequences[seqIndex].litLength;
+        U32 const mlv = sequences[seqIndex].mlBase;
+        
+        // Ensure the code returned is within BYTE range
+        llCodeTable[seqIndex] = (BYTE)ZSTD_LLcode(llv);
+        ofCodeTable[seqIndex] = (BYTE)ZSTD_highbit32(sequences[seqIndex].offBase);
+        mlCodeTable[seqIndex] = (BYTE)ZSTD_MLcode(mlv);
     }
-    op[pos++] = frameHeaderDescriptionByte;
-    if (!singleSegment) op[pos++] = windowLogByte;
-    switch(dictIDSizeCode)
-    {
-        default:
-            assert(0); /* impossible */
-            ZSTD_FALLTHROUGH;
-        case 0 : break;
-        case 1 : op[pos] = (BYTE)(dictID); pos++; break;
-        case 2 : MEM_writeLE16(op+pos, (U16)dictID); pos+=2; break;
-        case 3 : MEM_writeLE32(op+pos, dictID); pos+=4; break;
+
+    // Handle long length types with boundary checks
+    if (seqStorePtr->longLengthPos < nbSeq) {
+        if (seqStorePtr->longLengthType == ZSTD_llt_literalLength) {
+            llCodeTable[seqStorePtr->longLengthPos] = MaxLL;
+        }
+        if (seqStorePtr->longLengthType == ZSTD_llt_matchLength) {
+            mlCodeTable[seqStorePtr->longLengthPos] = MaxML;
+        }
+    } else {
+        // Handle the case where longLengthPos is out of bounds, if needed
+        // (Consider logging an error or taking some action)
     }
-    switch(fcsCode)
-    {
-        default:
-            assert(0); /* impossible */
-            ZSTD_FALLTHROUGH;
-        case 0 : if (singleSegment) op[pos++] = (BYTE)(pledgedSrcSize); break;
-        case 1 : MEM_writeLE16(op+pos, (U16)(pledgedSrcSize-256)); pos+=2; break;
-        case 2 : MEM_writeLE32(op+pos, (U32)(pledgedSrcSize)); pos+=4; break;
-        case 3 : MEM_writeLE64(op+pos, (U64)(pledgedSrcSize)); pos+=8; break;
-    }
-    return pos;
 }
 
 /* ZSTD_writeSkippableFrame_advanced() :

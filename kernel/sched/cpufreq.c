@@ -6,6 +6,7 @@
  * Author: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
  */
 
+
 DEFINE_PER_CPU(struct update_util_data __rcu *, cpufreq_update_util_data);
 
 /**
@@ -27,17 +28,21 @@ DEFINE_PER_CPU(struct update_util_data __rcu *, cpufreq_update_util_data);
  * called or it will WARN() and return with no effect.
  */
 void cpufreq_add_update_util_hook(int cpu, struct update_util_data *data,
-			void (*func)(struct update_util_data *data, u64 time,
-				     unsigned int flags))
+                                   void (*func)(struct update_util_data *data, u64 time,
+                                                unsigned int flags))
 {
-	if (WARN_ON(!data || !func))
-		return;
+    // Check for invalid parameters and log warnings
+    if (WARN_ON(!data || !func)) {
+        return;
+    }
 
-	if (WARN_ON(per_cpu(cpufreq_update_util_data, cpu)))
-		return;
+    if (WARN_ON(per_cpu(cpufreq_update_util_data, cpu))) {
+        return;
+    }
 
-	data->func = func;
-	rcu_assign_pointer(per_cpu(cpufreq_update_util_data, cpu), data);
+    // Assign the function pointer and update the CPU frequency data
+    data->func = func;
+    rcu_assign_pointer(per_cpu(cpufreq_update_util_data, cpu), data);
 }
 EXPORT_SYMBOL_GPL(cpufreq_add_update_util_hook);
 

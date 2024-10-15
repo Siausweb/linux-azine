@@ -217,6 +217,9 @@ void sched_autogroup_exit(struct signal_struct *sig)
 	autogroup_kref_put(sig->autogroup);
 }
 
+/// @brief 
+/// @param str 
+/// @return 
 static int __init setup_autogroup(char *str)
 {
 	sysctl_sched_autogroup_enabled = 0;
