@@ -2423,7 +2423,7 @@ __perf_remove_from_context(struct perf_event *event,
 	struct perf_event_pmu_context *pmu_ctx = event->pmu_ctx;
 	unsigned long flags = (unsigned long)info;
 
-	ctx_time_update(cpuctx, ctx);
+	ctx_time_update(cpuctx, ctx, false);
 
 	/*
 	 * Ensure event_sched_out() switches to OFF, at the very least
@@ -2652,7 +2652,7 @@ EXPORT_SYMBOL_GPL(perf_event_disable);
 void perf_event_disable_inatomic(struct perf_event *event)
 {
 	event->pending_disable = 1;
-	irq_work_queue(&event->pending_disable_irq);
+	irq_work_queue(&event->pending_irq);
 }
 
 #define MAX_INTERRUPTS (~0ULL)
@@ -2706,7 +2706,7 @@ event_sched_in(struct perf_event *event, struct perf_event_context *ctx)
 
 	if (!is_software_event(event))
 		cpc->active_oncpu++;
-	if (event->attr.freq && event->attr.sample_freq) {
+	if (event->attr.freq && event->attr.sample_freq)
 		ctx->nr_freq++;
 
 	if (event->attr.exclusive)
@@ -2860,9 +2860,7 @@ static void ctx_resched(struct perf_cpu_context *cpuctx,
 
 	event_type &= EVENT_ALL;
 
-	for_each_epc(epc, &cpuctx->ctx, pmu, false)
-		perf_pmu_disable(epc->pmu);
-
+	perf_ctx_disable(&cpuctx->ctx, pmu, false);
 	if (task_ctx) {
 		for_each_epc(epc, task_ctx, pmu, false)
 			perf_pmu_disable(epc->pmu);
@@ -3472,6 +3470,10 @@ ctx_sched_out(struct perf_event_context *ctx, struct pmu *pmu, enum event_type_t
 		barrier();
 	}
 
+	ctx->is_active &= ~event_type;
+	if (!(ctx->is_active & EVENT_ALL))
+		ctx->is_active = 0;
+
 	if (ctx->task) {
 		WARN_ON_ONCE(cpuctx->task_ctx != ctx);
 		if (!(ctx->is_active & EVENT_ALL))
@@ -3852,6 +3854,7 @@ static void swap_ptr(void *l, void *r, void __always_unused *args)
 DEFINE_MIN_HEAP(struct perf_event *, perf_event_min_heap);
 
 static const struct min_heap_callbacks perf_min_heap = {
+	.elem_size = sizeof(struct perf_event *),
 	.less = perf_less_group_idx,
 	.swp = swap_ptr,
 };
@@ -3943,7 +3946,7 @@ static noinline int visit_groups_merge(struct perf_event_context *ctx,
 
 		*evt = perf_event_groups_next(*evt, pmu);
 		if (*evt)
-			min_heap_sift_down(&event_heap, 0, &perf_min_heap, NULL);
+			min_heapify(&event_heap, 0, &perf_min_heap, NULL);
 		else
 			min_heap_pop(&event_heap, &perf_min_heap, NULL);
 	}
@@ -4023,8 +4026,9 @@ static void pmu_groups_sched_in(struct perf_event_context *ctx,
 			   merge_sched_in, &can_add_hw);
 }
 
-static void __pmu_ctx_sched_in(struct perf_event_pmu_context *pmu_ctx,
-			       enum event_type_t event_type)
+static void __pmu_ctx_groups_sched_in(struct perf_event_pmu_context *pmu_ctx,
+			    	struct perf_event_groups *groups,
+					bool cgroup)
 {
 	struct perf_event_pmu_context *pmu_ctx;
 
@@ -4506,7 +4510,7 @@ static void perf_event_enable_on_exec(struct perf_event_context *ctx)
 
 	cpuctx = this_cpu_ptr(&perf_cpu_context);
 	perf_ctx_lock(cpuctx, ctx);
-	ctx_time_freeze(cpuctx, ctx);
+	ctx_time_freeze(cpuctx, ctx, EVENT_TIME);
 
 	list_for_each_entry(event, &ctx->event_list, event_entry) {
 		enabled |= event_enable_on_exec(event, ctx);
@@ -4519,6 +4523,9 @@ static void perf_event_enable_on_exec(struct perf_event_context *ctx)
 	if (enabled) {
 		clone_ctx = unclone_ctx(ctx);
 		ctx_resched(cpuctx, ctx, NULL, event_type);
+	} else { 
+		ctx_sched_in(cpuctx, ctx, EVENT_TIME);
+	}
 	}
 	perf_ctx_unlock(cpuctx, ctx);
 
@@ -6862,6 +6869,14 @@ static const struct file_operations perf_fops = {
  * to user-space before waking everybody up.
  */
 
+static inline struct fasync_struct **perf_event_fasync(struct perf_event *event)
+{
+	/* only the parent has fasync state */
+	if (event->parent)
+		event = event->parent;
+	return &event->fasync;
+}
+
 void perf_event_wakeup(struct perf_event *event)
 {
 	ring_buffer_wakeup(event);
@@ -6896,7 +6911,7 @@ static void perf_sigtrap(struct perf_event *event)
 /*
  * Deliver the pending work in-event-context or follow the context.
  */
-static void __perf_pending_disable(struct perf_event *event)
+static void __perf_pending_irq(struct perf_event *event)
 {
 	int cpu = READ_ONCE(event->oncpu);
 
@@ -6911,6 +6926,11 @@ static void __perf_pending_disable(struct perf_event *event)
 	 * Yay, we hit home and are in the context of the event.
 	 */
 	if (cpu == smp_processor_id()) {
+		if (event->pending_sigtrap) {
+			event->pending_sigtrap = 0;
+			perf_sigtrap(event);
+			local_dec(&event->ctx->nr_pending);
+		}
 		if (event->pending_disable) {
 			event->pending_disable = 0;
 			perf_event_disable_local(event);
@@ -6961,6 +6981,8 @@ static void perf_pending_irq(struct irq_work *entry)
 		perf_event_wakeup(event);
 	}
 
+	__perf_pending_irq(event);
+
 	if (rctx >= 0)
 		perf_swevent_put_recursion_context(rctx);
 }
@@ -6985,13 +7007,16 @@ static void perf_pending_task(struct callback_head *head)
 	if (event->pending_work) {
 		event->pending_work = 0;
 		perf_sigtrap(event);
-		local_dec(&event->ctx->nr_no_switch_fast);
+		local_dec(&event->ctx->nr_pending);
 		rcuwait_wake_up(&event->pending_work_wait);
 	}
 	rcu_read_unlock();
 
 	if (rctx >= 0)
 		perf_swevent_put_recursion_context(rctx);
+	preempt_enable_notrace();
+
+	put_event(event);
 }
 
 #ifdef CONFIG_GUEST_PERF_EVENTS
@@ -7525,38 +7550,38 @@ void perf_output_sample(struct perf_output_handle *handle,
 		__output_copy(handle, data->callchain, size);
 	}
 
-	if (sample_type & PERF_SAMPLE_RAW) {
-		struct perf_raw_record *raw = data->raw;
+if (sample_type & PERF_SAMPLE_RAW) {
+    struct perf_raw_record *raw = data->raw;
 
-		if (raw) {
-			struct perf_raw_frag *frag = &raw->frag;
+    if (!raw) {
+        struct {
+            u32 size;
+            u32 data;
+        } raw_empty = { .size = sizeof(u32), .data = 0 };
+        
+        perf_output_put(handle, raw_empty);
+        return; // Early return to reduce nesting
+    }
 
-			perf_output_put(handle, raw->size);
-			do {
-				if (frag->copy) {
-					__output_custom(handle, frag->copy,
-							frag->data, frag->size);
-				} else {
-					__output_copy(handle, frag->data,
-						      frag->size);
-				}
-				if (perf_raw_frag_last(frag))
-					break;
-				frag = frag->next;
-			} while (1);
-			if (frag->pad)
-				__output_skip(handle, NULL, frag->pad);
-		} else {
-			struct {
-				u32	size;
-				u32	data;
-			} raw = {
-				.size = sizeof(u32),
-				.data = 0,
-			};
-			perf_output_put(handle, raw);
-		}
-	}
+    struct perf_raw_frag *frag = &raw->frag;
+
+    perf_output_put(handle, raw->size);
+    do {
+        if (frag->copy) {
+            __output_custom(handle, frag->copy, frag->data, frag->size);
+        } else {
+            __output_copy(handle, frag->data, frag->size);
+        }
+        if (perf_raw_frag_last(frag))
+            break;
+        
+        frag = frag->next;
+    } while (1);
+    
+    if (frag->pad) {
+		__output_skip(handle, NULL, frag->pad);
+		    }
+}
 
 	if (sample_type & PERF_SAMPLE_BRANCH_STACK) {
 		if (data->br_stack) {
